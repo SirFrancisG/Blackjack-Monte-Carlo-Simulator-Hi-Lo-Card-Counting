@@ -1,0 +1,436 @@
+import random
+import statistics
+import matplotlib.pyplot as plt
+
+
+# BASE CONFIGURATION
+INITIAL_BANKROLL = 10_000
+BASE_BET = 10
+MAX_BET = 1_200
+
+NUM_DECKS = 6
+NUM_PLAYERS = 4          # ME + 3 bots
+PENETRATION = 0.25       # reshuffle at 75% penetration
+NUM_SESSIONS = 1000
+HANDS_MIN = 200
+HANDS_MAX = 1000
+
+RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A']
+
+
+# CARD / HAND UTILITIES
+def create_shoe(num_decks=NUM_DECKS):
+    """Create and shuffle the shoe (multi-deck)."""
+    shoe = RANKS * 4 * num_decks
+    random.shuffle(shoe)
+    return shoe
+
+
+def card_value(rank):
+    """Card value for total calculation (Ace initially counts as 11)."""
+    if rank in ['J', 'Q', 'K', '10']:
+        return 10
+    if rank == 'A':
+        return 11
+    return int(rank)
+
+
+def hand_value(hand):
+    """
+    Returns (total, soft).
+    soft = True if at least one Ace is still counted as 11.
+    """
+    total = 0
+    aces = 0
+    for r in hand:
+        total += card_value(r)
+        if r == 'A':
+            aces += 1
+
+    soft = False
+    while total > 21 and aces > 0:
+        total -= 10
+        aces -= 1
+
+    if aces > 0:
+        soft = True
+
+    return total, soft
+
+
+def is_blackjack(hand):
+    """Natural blackjack: 2-card hand totaling 21."""
+    total, _ = hand_value(hand)
+    return len(hand) == 2 and total == 21
+
+
+# HI-LO CARD COUNTING
+def hi_lo_value(rank):
+    """Hi-Lo count value for a single card."""
+    if rank in ['2', '3', '4', '5', '6']:
+        return 1
+    if rank in ['7', '8', '9']:
+        return 0
+    return -1  # 10, J, Q, K, A
+
+
+# BASIC STRATEGY
+def should_double_down(hand, dealer_up):
+    """
+    Returns True if the player should double down.
+    Rules applied:
+    - Hard 11: always double down.
+    - Hard 10: double down unless dealer shows a 10-value card or Ace.
+    Only valid on the opening two cards (no soft doubling in this model).
+    """
+    if len(hand) != 2:
+        return False
+
+    total, soft = hand_value(hand)
+    if soft:
+        return False  # no soft doubling in this simplified strategy
+
+    if total == 11:
+        return True
+    if total == 10 and dealer_up not in ['10', 'J', 'Q', 'K', 'A']:
+        return True
+
+    return False
+
+
+def basic_strategy_hit(hand, dealer_up):
+    """
+    Returns True if the player should HIT, False if STAND.
+    Basic strategy (simplified):
+    - Hard 17+: stand
+    - Hard 13-16: stand if dealer shows 2-6, otherwise hit
+    - Hard 12: stand if dealer shows 4-6, otherwise hit
+    - Hard 11 or less: hit
+    - Soft 19+: stand
+    - Soft 18 or less: hit
+    """
+    total, soft = hand_value(hand)
+
+    if soft:
+        return total < 19  # stand on soft 19+
+
+    if total >= 17:
+        return False
+    if 13 <= total <= 16:
+        return dealer_up not in ['2', '3', '4', '5', '6']
+    if total == 12:
+        return dealer_up not in ['4', '5', '6']
+    return True  # hard 11 or less: always hit
+
+
+# SINGLE SESSION SIMULATION
+def simulate_session(
+    num_hands,
+    use_counting=True,
+    initial_bankroll=INITIAL_BANKROLL,
+    base_bet=BASE_BET,
+    max_bet=MAX_BET,
+    num_decks=NUM_DECKS,
+    num_players=NUM_PLAYERS,
+    penetration=PENETRATION,
+):
+    """
+    Simulates a single blackjack session.
+
+    Dealer rules : H17 - dealer hits on soft 17.
+    Player rules : basic strategy + double down on hard 10 and 11.
+
+    Returns:
+        path         (list[float]) - bankroll snapshot after each hand
+        final        (float)       - final bankroll
+        bankrupt     (bool)        - whether the player went broke
+        min_bankroll (float)
+        max_bankroll (float)
+    """
+    initial_shoe_size = 52 * num_decks
+    shoe = create_shoe(num_decks)
+    running_count = 0
+
+    bankroll = initial_bankroll
+    path = [bankroll]
+    bankrupt = False
+    min_bankroll = bankroll
+    max_bankroll = bankroll
+
+    for _ in range(num_hands):
+
+        # If broke, freeze bankroll and keep path length consistent
+        if bankroll <= 0:
+            bankrupt = True
+            path.append(bankroll)
+            continue
+
+        # Reshuffle at penetration threshold
+        if len(shoe) < (penetration) * initial_shoe_size:
+            shoe = create_shoe(num_decks)
+            running_count = 0
+
+        # True Count
+        decks_remaining = len(shoe) / 52.0
+        true_count = running_count / decks_remaining if decks_remaining > 0 else 0.0
+
+        # Bet sizing
+        if use_counting:
+            tc = true_count
+            if tc >= 4:
+                desired_bet = 1_200
+            elif tc >= 3:
+                desired_bet = 500
+            elif tc >= 2:
+                desired_bet = 200
+            elif tc >= 1:
+                desired_bet = 50
+            else:
+                desired_bet = base_bet
+        else:
+            desired_bet = base_bet
+
+        bet = min(desired_bet, bankroll)
+
+        # Initial deal
+        players = [[] for _ in range(num_players)]
+        dealer = []
+
+        for p in range(num_players):       # first card, face up
+            card = shoe.pop()
+            players[p].append(card)
+            running_count += hi_lo_value(card)
+
+        card = shoe.pop()                  # dealer up-card
+        dealer.append(card)
+        running_count += hi_lo_value(card)
+        dealer_up = dealer[0]
+
+        for p in range(num_players):       # second card, face up
+            card = shoe.pop()
+            players[p].append(card)
+            running_count += hi_lo_value(card)
+
+        dealer_hole = shoe.pop()           # hole card (counted only when revealed)
+        dealer.append(dealer_hole)
+
+        player0_initial = list(players[0])
+        dealer_initial  = list(dealer)
+
+        # Players' turns
+        for p in range(num_players):
+            hand = players[p]
+
+            if is_blackjack(hand):
+                continue  # natural blackjack: no further action
+
+            # Double down (bankroll impact tracked for player 0 only)
+            if p == 0 and should_double_down(hand, dealer_up):
+                additional = min(bet, bankroll - bet)  # cannot double beyond bankroll
+                bet += additional
+                if not shoe:
+                    shoe = create_shoe(num_decks)
+                    running_count = 0
+                card = shoe.pop()
+                hand.append(card)
+                running_count += hi_lo_value(card)
+                continue  # one card only, then stand
+
+            # Standard hit / stand loop
+            while True:
+                total, _ = hand_value(hand)
+                if total > 21:
+                    break
+                if not basic_strategy_hit(hand, dealer_up):
+                    break
+                if not shoe:
+                    shoe = create_shoe(num_decks)
+                    running_count = 0
+                card = shoe.pop()
+                hand.append(card)
+                running_count += hi_lo_value(card)
+
+        # Dealer's turn -- H17 rule
+        running_count += hi_lo_value(dealer_hole)  # reveal hole card
+
+        while True:
+            total, soft = hand_value(dealer)
+            # Stand on hard 17+; hit on soft 17
+            if total > 17:
+                break
+            if total == 17 and not soft:
+                break
+            # Hits when total < 17, OR total == 17 and soft
+            if not shoe:
+                shoe = create_shoe(num_decks)
+                running_count = 0
+            card = shoe.pop()
+            dealer.append(card)
+            running_count += hi_lo_value(card)
+
+        # Payout for player 0
+        player_total, _ = hand_value(players[0])
+        dealer_total, _ = hand_value(dealer)
+
+        player_bj = is_blackjack(player0_initial)
+        dealer_bj = is_blackjack(dealer_initial)
+
+        if player_bj:
+            if not dealer_bj:
+                bankroll += 1.5 * bet   # blackjack pays 3:2
+            # else: push
+        elif dealer_bj:
+            bankroll -= bet
+        else:
+            if player_total > 21:
+                bankroll -= bet
+            elif dealer_total > 21:
+                bankroll += bet
+            elif player_total > dealer_total:
+                bankroll += bet
+            elif player_total < dealer_total:
+                bankroll -= bet
+            # else: push
+
+        min_bankroll = min(min_bankroll, bankroll)
+        max_bankroll = max(max_bankroll, bankroll)
+        path.append(bankroll)
+
+    return path, bankroll, bankrupt, min_bankroll, max_bankroll
+
+
+# MONTE CARLO
+def run_monte_carlo(
+    num_sessions=NUM_SESSIONS,
+    hands_min=HANDS_MIN,
+    hands_max=HANDS_MAX,
+):
+    """
+    Runs the Monte Carlo simulation for two scenarios:
+      - WITH counting  : Hi-Lo true count + bet spread
+      - WITHOUT counting: flat betting at base bet
+    """
+    results = {
+        "counting": {"finals": [], "bankrupt": [], "min": [], "max": [], "paths": []},
+        "flat":     {"finals": [], "bankrupt": [], "min": [], "max": [], "paths": []},
+    }
+
+    for _ in range(num_sessions):
+        num_hands = random.randint(hands_min, hands_max)
+
+        path_c, final_c, br_c, min_c, max_c = simulate_session(num_hands, use_counting=True)
+        results["counting"]["finals"].append(final_c)
+        results["counting"]["bankrupt"].append(br_c)
+        results["counting"]["min"].append(min_c)
+        results["counting"]["max"].append(max_c)
+        results["counting"]["paths"].append(path_c)
+
+        path_f, final_f, br_f, min_f, max_f = simulate_session(num_hands, use_counting=False)
+        results["flat"]["finals"].append(final_f)
+        results["flat"]["bankrupt"].append(br_f)
+        results["flat"]["min"].append(min_f)
+        results["flat"]["max"].append(max_f)
+        results["flat"]["paths"].append(path_f)
+
+    return results
+
+
+# STATISTICS & PLOTS
+def compute_stats(results, initial_bankroll=INITIAL_BANKROLL):
+    """
+    Computes summary statistics for each scenario.
+    Returns a dict with mean_roi, pct_winners, pct_bankrupt,
+    global_min, global_max, and the counting edge over flat.
+    """
+    stats_all = {}
+
+    for mode in ["counting", "flat"]:
+        finals         = results[mode]["finals"]
+        bankrupt_flags = results[mode]["bankrupt"]
+        mins           = results[mode]["min"]
+        maxs           = results[mode]["max"]
+
+        rois         = [(f - initial_bankroll) / initial_bankroll for f in finals]
+        mean_roi     = statistics.mean(rois)
+        pct_winners  = sum(1 for r in rois if r > 0) / len(rois) * 100
+        pct_bankrupt = sum(1 for b in bankrupt_flags if b) / len(bankrupt_flags) * 100
+
+        stats_all[mode] = {
+            "mean_roi":     mean_roi,
+            "pct_winners":  pct_winners,
+            "pct_bankrupt": pct_bankrupt,
+            "global_min":   min(mins),
+            "global_max":   max(maxs),
+        }
+
+    stats_all["edge"] = (
+        stats_all["counting"]["mean_roi"] - stats_all["flat"]["mean_roi"]
+    )
+    return stats_all
+
+
+def plot_paths(results, mode="counting", max_paths=None):
+    """Bankroll pathway chart across all simulated sessions."""
+    paths = results[mode]["paths"]
+    if max_paths is not None:
+        paths = paths[:max_paths]
+
+    plt.figure(figsize=(10, 6))
+    for path in paths:
+        plt.plot(path, alpha=0.5, linewidth=0.8)
+    plt.axhline(
+        y=INITIAL_BANKROLL, color='black', linestyle='--',
+        linewidth=1.2, label='Starting bankroll'
+    )
+    plt.xlabel("Hands played")
+    plt.ylabel("Bankroll (EUR)")
+    plt.title(f"Bankroll Pathways - {mode.upper()}")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_final_hist(results):
+    """Histogram comparing the final bankroll distribution for both scenarios."""
+    finals_c = results["counting"]["finals"]
+    finals_f = results["flat"]["finals"]
+
+    plt.figure(figsize=(10, 6))
+    plt.hist(finals_c, bins=50, alpha=0.55, label="With counting",    color="steelblue")
+    plt.hist(finals_f, bins=50, alpha=0.55, label="Without counting", color="tomato")
+    plt.axvline(
+        x=INITIAL_BANKROLL, color='black', linestyle='--',
+        linewidth=1.2, label='Starting bankroll'
+    )
+    plt.xlabel("Final bankroll (EUR)")
+    plt.ylabel("Frequency")
+    plt.title("Final Bankroll Distribution - Monte Carlo")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+# MAIN
+if __name__ == "__main__":
+    print("Running Monte Carlo blackjack simulation...")
+    results = run_monte_carlo()
+
+    print("\nComputing statistics...")
+    stats_all = compute_stats(results)
+
+    for mode in ["counting", "flat"]:
+        s = stats_all[mode]
+        print(f"\n=== {mode.upper()} ===")
+        print(f"  Avg ROI:            {s['mean_roi'] * 100:+.2f}%")
+        print(f"  % winning sessions: {s['pct_winners']:.1f}%")
+        print(f"  % bankrupt:         {s['pct_bankrupt']:.1f}%")
+        print(f"  Min bankroll:       EUR {s['global_min']:,.2f}")
+        print(f"  Max bankroll:       EUR {s['global_max']:,.2f}")
+
+    print("\n=== Statistical Edge of Card Counting ===")
+    print(f"  Delta Mean ROI (counting - flat): {stats_all['edge'] * 100:+.2f}%")
+
+    plot_paths(results, mode="counting")
+    plot_paths(results, mode="flat")
+    plot_final_hist(results)
